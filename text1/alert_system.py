@@ -97,49 +97,76 @@ class AutoAlertBot:
                     continue
 
                 # 2. 准备计算
+                # 2. 准备计算
                 close = pd.to_numeric(df['close'])
                 
-                # -----------------------------------------------------------
-                # ⚠️ 关键修改：全部取 iloc[-2] (上一根收盘确定的K线)
-                # 这样 价格 和 均线 都是“死值”，信号绝对稳定，不会闪烁
-                # -----------------------------------------------------------
+                # --- A. 预先计算完整的均线序列 (因为我们要回溯前几根) ---
+                ma31_series = close.rolling(31).mean()
+                ma128_series = close.rolling(128).mean()
+                ma373_series = close.rolling(373).mean()
                 
-                # 基准价格 (上一根收盘价)
-                prev_close = float(close.iloc[-2]) 
-                
-                # 基准均线 (上一根K线算出来的均线)
-                ma31 = float(close.rolling(31).mean().iloc[-2])
-                ma128 = float(close.rolling(128).mean().iloc[-2])
-                ma373 = float(close.rolling(373).mean().iloc[-2])
-                
-                # 当前最新价 (仅用于给你看盘，不参与信号计算)
-                current_price = float(close.iloc[-1]) 
+                # --- B. 定义一个判断函数 (检查某根K线收盘价是否大于三条均线) ---
+                def is_bullish_breakout(idx):
+                    p = float(close.iloc[idx])
+                    m1 = float(ma31_series.iloc[idx])
+                    m2 = float(ma128_series.iloc[idx])
+                    m3 = float(ma373_series.iloc[idx])
+                    # 条件：收盘价 同时大于 三条均线
+                    return (p > m1) and (p > m2) and (p > m3)
 
-                # 3. 打印详细状态 (分两行打印，清晰明了)
+                def is_bearish_breakout(idx):
+                    p = float(close.iloc[idx])
+                    m1 = float(ma31_series.iloc[idx])
+                    m2 = float(ma128_series.iloc[idx])
+                    m3 = float(ma373_series.iloc[idx])
+                    # 条件：收盘价 同时小于 三条均线
+                    return (p < m1) and (p < m2) and (p < m3)
+
+                # --- C. 获取关键数据 (用于显示和逻辑) ---
+                # 当前最新价 (仅展示)
+                current_price = float(close.iloc[-1])
+                # 上一根完成的K线 (T) 的收盘价
+                prev_close = float(close.iloc[-2])
+                
+                # --- D. 执行“前4根”逻辑检测 ---
+                # T= -2 (最新完成), T-1= -3, T-2= -4, T-3= -5
+                
+                # 1. 检查最新完成的那一根 (必须满足条件)
+                bull_current = is_bullish_breakout(-2)
+                bear_current = is_bearish_breakout(-2)
+                
+                # 2. 检查前3根 (必须【不】满足条件)
+                # 只要前3根里，有任意一根满足了条件，就说明早就突破了，不是“首次”
+                # 所以要求：前3根全部为 False
+                bull_pre_check = (not is_bullish_breakout(-3)) and \
+                                 (not is_bullish_breakout(-4)) and \
+                                 (not is_bullish_breakout(-5))
+                                 
+                bear_pre_check = (not is_bearish_breakout(-3)) and \
+                                 (not is_bearish_breakout(-4)) and \
+                                 (not is_bearish_breakout(-5))
+
+                # 3. 打印详细状态
                 t_str = time.strftime("%H:%M:%S")
-                
-                # 第一行：实时行情 (让你知道程序还活着)
-                print(f"[{t_str}] 🔴 实时最新价: {current_price:.2f}")
-                
-                # 第二行：信号判断依据 (这是你最关心的逻辑数据)
-                # 逻辑是：用这个收盘价，去对比后面的均线
-                print(f"   └── 🟢 信号判断依据(上根收盘): 价格:{prev_close:.2f} | MA31:{ma31:.2f} | MA128:{ma128:.2f} | MA373:{ma373:.2f}")
-                print("-" * 60) # 分隔线
+                print(f"[{t_str}] 🔴 实时最新价: {current_price:.2f} 检测线收盘价：{prev_close}")
+                print(f"   └── 🔎 突破检测(T=-2): {'✅满足' if bull_current or bear_current else '❌未满足'} | 前三根保持沉寂: {'✅是' if bull_pre_check or bear_pre_check else '❌否(已有前值)'}")
+                print("-" * 60)
 
-                # 4. 信号判断 (使用 prev_close 和 上一根均线)
+                # 4. 信号判断
                 new_signal = None
                 alert_text = ""
 
                 # --- 开多逻辑 ---
-                if (prev_close > ma31) and (ma31 > ma128) and (ma128 > ma373):
+                # 逻辑：当前K线站上均线 AND 前三根K线都在均线之下(或未完全站上)
+                if bull_current and bull_pre_check:
                     new_signal = 'LONG'
-                    alert_text = f"开多信号确认 (价格{prev_close} > MA31)"
+                    alert_text = f"多头起爆确认 (价格{prev_close:.2f} 首次站上三均线)"
                 
                 # --- 开空逻辑 ---
-                elif (prev_close < ma31) and (ma373 > ma128) and (ma128 > ma31):
+                # 逻辑：当前K线跌破均线 AND 前三根K线都在均线之上(或未完全跌破)
+                elif bear_current and bear_pre_check:
                     new_signal = 'SHORT'
-                    alert_text = f"开空信号确认 (价格{prev_close} < MA31)"
-
+                    alert_text = f"空头起爆确认 (价格{prev_close:.2f} 首次跌破三均线)"
                 # 5. 状态机处理
                 if new_signal != self.last_signal:
                     if new_signal:
@@ -152,7 +179,7 @@ class AutoAlertBot:
                     self.last_signal = new_signal
                 
                 # 6. 等待
-                time.sleep(10)
+                time.sleep(5)
 
             except KeyboardInterrupt:
                 print("\n🛑 程序已停止")

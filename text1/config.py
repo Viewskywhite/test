@@ -5,7 +5,7 @@ class Config:
     
     # True = 测试网 (资金是假的)，False = 实盘 (资金是真的)
     # 强烈建议先用 True 跑通流程！
-    SANDBOX_MODE = True
+    SANDBOX_MODE = False
 
     # ================= 交易目标 =================
     SYMBOL = 'BTC/USDT'  # 交易对
@@ -25,7 +25,7 @@ class Config:
     TIMEFRAMES = ['5m', '15m', '30m', '1h']    # K线周期：15分钟
     # === 策略交易设置 ===
     # 这一行是机器人用来下单的主周期 (必须包含在上面列表里)
-    TRADE_TIMEFRAME = '15m'
+    TRADE_TIMEFRAME = '5m'
 
     MA_FAST = 5          # 快线周期
     MA_SLOW = 20         # 慢线周期
