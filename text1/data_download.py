@@ -88,6 +88,6 @@ if __name__ == "__main__":
     
     # 建议下载时间：最近2-3年比较有参考价值
     START = '2020-01-01 00:00:00'
-    END =   '2026-01-01 00:00:00'
+    END =   '2026-01-10 00:00:00'
 
     fetch_binance_futures_data(SYMBOL, TIMEFRAME, START, END)

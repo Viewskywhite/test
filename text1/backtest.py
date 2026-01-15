@@ -19,8 +19,8 @@ ENABLE_SHORT = True     # 是否允许做空
 
 # 【注意】这里是回测的时间范围
 # 你的CSV文件必须包含这段时间的数据，否则会报错空数据
-START_TIME = '2025-01-01 00:00:00'  
-END_TIME   = '2026-01-01 00:00:00'  
+START_TIME = '2025-12-01 00:00:00'  
+END_TIME   = '2026-01-10 00:00:00'  
 
 # === 核心参数 ===
 LEVERAGE = 10           # 杠杆倍数
@@ -33,8 +33,11 @@ FEE_RATE = 0.0004       # 手续费 (万5)
 # === 仓位管理 （复利）===
 FIXED_MARGIN_RATE = 0.7 # 每次开单的金额比例
 
-# 同向开单的距离阈值 1.5%
-SAME_SIDE_DISTANCE = 0.015
+# ===偏离值===
+#True是打开偏离值，False为关闭偏离值
+SIDE_DISTANCE_SWITCH = True
+SAME_SIDE_DISTANCE_LONG = 0.015
+SAME_SIDE_DISTANCE_SHORT =0.015
 
 # --- RSI 策略参数 ---
 RSI_PERIOD = 14       
@@ -193,6 +196,14 @@ def run_backtest(df):
                 if is_closed:
                     pnl = (order['entry_price'] - exec_price) * order['amount'] - (exec_price * order['amount'] * FEE_RATE) - order['entry_fee']
                     balance += order['margin'] + pnl; profit = pnl
+                    if balance < 0:
+                        # 如果余额归零，尝试用备用金填坑，或者直接标记破产
+                        if reserve_fund > abs(balance):
+                            reserve_fund += balance # 填坑
+                            balance = 0
+                        else:
+                            print("💀 账户彻底破产！")
+                            balance = 0 # 实际上这里应该直接结束回测 break
 
             if is_closed:
                 icon = "🟢" if profit > 0 else "🔴"
@@ -219,26 +230,33 @@ def run_backtest(df):
                 signal = 'short'
             
             # --- 2. 👇【核心2】再应用“同向过滤”逻辑 ---
-            if signal:
-                # 只有当【本次信号】等于【上次方向】时，才进行严苛检查
-                if last_trade_type is not None and signal == last_trade_type:
-                    
-                    # 如果是同向追多：开盘价必须拉开 1.5%
-                    if signal == 'long':
-                        threshold = last_ma373 * (1 + SAME_SIDE_DISTANCE)
-                        if current_open <= threshold:
-                            # print(f"🚫 过滤同向追多: 离均线不够远 (需 > {threshold:.2f})")
-                            signal = None # 撤销信号
+            # 直接判断布尔值，只要 SIDE_DISTANCE_SWITCH 为 True 就会执行
+            if SIDE_DISTANCE_SWITCH:
+                if signal:
+                    # 只有当【本次信号】等于【上次方向】时，才进行严苛检查
+                    if last_trade_type is not None and signal == last_trade_type:
+                        
+                        # --- 过滤同向追多 ---
+                        # 逻辑：如果做多，价格必须比 MA373 高出一定比例 (例如 1.5%)
+                        if signal == 'long':
+                            threshold = last_ma373 * (1 + SAME_SIDE_DISTANCE_LONG)
+                            # 如果当前开盘价 <= 阈值 (说明离均线不够远，还在缠绕)，则撤销信号
+                            if current_open <= threshold:
+                                # print(f"🚫 过滤同向追多: 离均线不够远 (当前:{current_open} < 需:{threshold:.2f})")
+                                signal = None 
 
-                    # 如果是同向追空：开盘价必须拉开 1.5%
-                    elif signal == 'short':
-                        threshold = last_ma373 * (1 - SAME_SIDE_DISTANCE)
-                        if current_open >= threshold:
-                            # print(f"🚫 过滤同向追空: 离均线不够远 (需 < {threshold:.2f})")
-                            signal = None # 撤销信号
+                        # --- 过滤同向追空 ---
+                        # 逻辑：如果做空，价格必须比 MA373 低出一定比例
+                        elif signal == 'short':
+                            threshold = last_ma373 * (1 - SAME_SIDE_DISTANCE_SHORT)
+                            # 如果当前开盘价 >= 阈值 (说明离均线不够远)，则撤销信号
+                            if current_open >= threshold:
+                                # print(f"🚫 过滤同向追空: 离均线不够远 (当前:{current_open} > 需:{threshold:.2f})")
+                                signal = None 
 
             # --- 3. 执行开仓 ---
             if signal:
+
                 last_trade_type = signal #记录方向
                 
                 # ------------------------------------------------------
@@ -316,7 +334,7 @@ if __name__ == "__main__":
     df = load_from_csv(CSV_PATH)
     
     # =========================================================
-    # === 🛑 统一时间处理逻辑 (彻底修复1970问题) ===
+    # === 🛑 统一时间处理逻辑 ===
     # =========================================================
     import pandas as pd
     import plotly.graph_objects as go
@@ -324,75 +342,87 @@ if __name__ == "__main__":
     import webbrowser
     import os
     import time
+    import numpy as np # 确保导入numpy
 
     print("\n" + "="*40)
     print("🔍 数据预处理...")
 
     # --- 步骤A: 锁定时间列数据 ---
-    # 逻辑：优先找 'open_time'，找不到就找 'timestamp'，还找不到就强制取【第1列】
-    # 绝不使用 df.index (那是导致1970的罪魁祸首)
-    
     raw_time_series = None
-    col_name_used = "Unknown"
-
     if 'open_time' in df.columns:
         raw_time_series = df['open_time']
-        col_name_used = "open_time"
     elif 'timestamp' in df.columns:
         raw_time_series = df['timestamp']
-        col_name_used = "timestamp"
     else:
-        # 强制使用第一列
         raw_time_series = df.iloc[:, 0]
-        col_name_used = f"第1列 ({df.columns[0]})"
     
-    print(f"👉 使用列 [{col_name_used}] 作为时间基准")
-
     # --- 步骤B: 智能转换格式 ---
-    first_val = raw_time_series.iloc[0]
-    final_time_index = None
-
     try:
-        # 情况1: 字符串
+        first_val = raw_time_series.iloc[0]
         if isinstance(first_val, str):
             final_time_index = pd.to_datetime(raw_time_series)
-            print("✅ 格式识别: 字符串日期 (2020-01-01...)")
-            
-        # 情况2: 数字 (时间戳)
         elif isinstance(first_val, (int, float, np.integer, np.floating)):
-            # 如果数值很大(>100亿)，说明是毫秒
             if first_val > 10000000000: 
                 final_time_index = pd.to_datetime(raw_time_series, unit='ms')
-                print("✅ 格式识别: 毫秒级时间戳 (Unix ms)")
             else:
                 final_time_index = pd.to_datetime(raw_time_series, unit='s')
-                print("✅ 格式识别: 秒级时间戳 (Unix s)")
         else:
-            # 兜底
             final_time_index = pd.to_datetime(raw_time_series)
-            print("⚠️ 格式识别: 自动推断")
-
     except Exception as e:
-        print(f"❌ 时间转换严重错误: {e}")
-        print("停止运行，请检查CSV数据格式。")
+        print(f"❌ 时间转换错误: {e}")
         exit()
 
     print(f"📅 时间范围: {final_time_index.min()} ~ {final_time_index.max()}")
-    print("-" * 40)
 
     # 2. 运行回测
     trades, equity, final_reserve = run_backtest(df)
     
     if len(equity) > 0:
-        # === 🆕 资金统计与绘图 ===
         
-        # --- 数据对齐 ---
-        # 使用刚才算好的 final_time_index，不再重新计算
+        # --- 3. 核心统计计算 (新增峰值计算) ---
+        final_trading_balance = equity[-1]
+        total_initial_assets = INITIAL_BALANCE + INITIAL_RESERVE
+        total_final_assets = final_trading_balance + final_reserve
+        
+        # 总体盈亏
+        total_profit = total_final_assets - total_initial_assets
+        profit_rate = (total_profit / total_initial_assets) * 100
+        
+        # === 🆕 新增：计算历史最高资产与峰值收益率 ===
+        max_equity_value = max(equity) # 历史最高账户余额
+        # 注意：这里假设备用金不动，只计算交易账户的峰值带动整体资产的峰值
+        # 峰值总资产近似为 = 最高账户余额 + 剩余备用金 (略有误差但够用)
+        peak_total_assets = max_equity_value + final_reserve 
+        peak_profit_rate = ((peak_total_assets - total_initial_assets) / total_initial_assets) * 100
+
+        # === 文字版控制台打印 ===
+        # 胜率统计
+        total_trades = len(trades)
+        win_trades = len([t for t in trades if t['profit'] > 0])
+        loss_trades = total_trades - win_trades
+        win_rate = (win_trades / total_trades) * 100 if total_trades > 0 else 0
+
+        print("\n" + "="*40)
+        print(f"📊 回测结果 ({START_TIME} 至 {END_TIME})")
+        print(f"模式: 多[{'✅' if ENABLE_LONG else '❌'}] / 空[{'✅' if ENABLE_SHORT else '❌'}]")
+        print("-" * 40)
+        print(f"💰 资金详情:")
+        print(f"   初始总投入: {total_initial_assets:.2f} U (本金:{INITIAL_BALANCE} + 备用:{INITIAL_RESERVE})")
+        print(f"   最终总资产: {total_final_assets:.2f} U (账户:{final_trading_balance:.2f} + 备用:{final_reserve:.2f})")
+        print(f"   净盈亏:     {'+' if total_profit>0 else ''}{total_profit:.2f} U")
+        print(f"   总收益率:   {profit_rate:.2f}%")
+        print(f"   🚀 峰值收益: {peak_profit_rate:.2f}%")
+        print("-" * 40)
+        print(f"📈 交易详情:")
+        print(f"   总交易数:   {total_trades}")
+        print(f"   胜率:       {win_rate:.2f}% (✅{win_trades} / ❌{loss_trades})")
+        print("="*40)
+
+        # --- 4. 绘图数据对齐 ---
         len_df = len(final_time_index)
         len_equity = len(equity)
         
         if len_equity < len_df:
-            # 截取最后一段
             aligned_time_index = final_time_index[-len_equity:]
             aligned_equity = equity
         elif len_equity > len_df:
@@ -402,20 +432,10 @@ if __name__ == "__main__":
             aligned_time_index = final_time_index
             aligned_equity = equity
 
-        # 生成 Pandas Series
         equity_series = pd.Series(aligned_equity, index=aligned_time_index)
-        
-        # 计算盈亏
-        final_trading_balance = equity[-1]
-        total_initial_assets = INITIAL_BALANCE + INITIAL_RESERVE
-        total_final_assets = final_trading_balance + final_reserve
-        total_profit = total_final_assets - total_initial_assets
-        profit_rate = (total_profit / total_initial_assets) * 100
-        
-        daily_equity = equity_series.resample('D').last()
-        daily_pnl = daily_equity.diff().fillna(0) 
+        daily_pnl = equity_series.resample('D').last().diff().fillna(0) 
 
-        # --- Plotly 绘图 ---
+        # --- 5. Plotly 绘图 ---
         fig = make_subplots(
             rows=2, cols=1, 
             shared_xaxes=True, 
@@ -451,9 +471,19 @@ if __name__ == "__main__":
                 row=2, col=1
             )
 
-        # 布局
+        # === 🆕 标题设置 (BTC/USDT + 杠杆 + 峰值收益) ===
+        title_text = (
+            f"<b>BTC/USDT 量化回测报告</b><br>"
+            f"<sup>"
+            f"杠杆: {LEVERAGE}x | "
+            f"总收益: {profit_rate:.2f}% | "
+            f"峰值收益: {peak_profit_rate:.2f}% | "
+            f"周期: {START_TIME} ~ {END_TIME}"
+            f"</sup>"
+        )
+
         fig.update_layout(
-            title=f'<b>量化回测报告</b><br><sup>周期: {START_TIME} ~ {END_TIME} | 总收益: {profit_rate:.2f}% | 交易数: {len(trades)}</sup>',
+            title=title_text,
             template='plotly_dark',
             hovermode='x unified',
             dragmode='zoom',
@@ -467,7 +497,7 @@ if __name__ == "__main__":
             os.makedirs(save_dir)
             
         current_time_str = time.strftime("%Y%m%d_%H%M%S")
-        filename_html = f"backtest_report_{current_time_str}.html"
+        filename_html = f"backtest_BTC_USDT_{LEVERAGE}x_{current_time_str}.html"
         full_path_html = os.path.join(save_dir, filename_html)
         
         fig.write_html(full_path_html)

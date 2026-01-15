@@ -14,7 +14,7 @@ CONFIG = {
     # ⚠️ 这里的开关要注意：
     # 如果你在国内本地运行，必须设为 True
     # 如果你在海外服务器(AWS/香港阿里云)运行，设为 False
-    'USE_PROXY': False,           
+    'USE_PROXY': True,           
     'PROXY_URL': 'http://127.0.0.1:7890', # 你的梯子端口(Clash通常是7890)
     
     'ENABLE_TTS': True,         
@@ -112,7 +112,7 @@ class AutoAlertBot:
                     m2 = float(ma128_series.iloc[idx])
                     m3 = float(ma373_series.iloc[idx])
                     # 条件：收盘价 同时大于 三条均线
-                    return (p > m1) and (p > m2) and (p > m3)
+                    return (p > m1) and (m1 > m2) and (m2 > m3)
 
                 def is_bearish_breakout(idx):
                     p = float(close.iloc[idx])
@@ -120,7 +120,7 @@ class AutoAlertBot:
                     m2 = float(ma128_series.iloc[idx])
                     m3 = float(ma373_series.iloc[idx])
                     # 条件：收盘价 同时小于 三条均线
-                    return (p < m1) and (p < m2) and (p < m3)
+                    return (p < m1) and (m2 < m2) and (m3 < m3)
 
                 # --- C. 获取关键数据 (用于显示和逻辑) ---
                 # 当前最新价 (仅展示)
@@ -139,17 +139,15 @@ class AutoAlertBot:
                 # 只要前3根里，有任意一根满足了条件，就说明早就突破了，不是“首次”
                 # 所以要求：前3根全部为 False
                 bull_pre_check = (not is_bullish_breakout(-3)) and \
-                                 (not is_bullish_breakout(-4)) and \
-                                 (not is_bullish_breakout(-5))
+                                 (not is_bullish_breakout(-4)) 
                                  
                 bear_pre_check = (not is_bearish_breakout(-3)) and \
-                                 (not is_bearish_breakout(-4)) and \
-                                 (not is_bearish_breakout(-5))
-
+                                 (not is_bearish_breakout(-4))
+                 
                 # 3. 打印详细状态
                 t_str = time.strftime("%H:%M:%S")
                 print(f"[{t_str}] 🔴 实时最新价: {current_price:.2f} 检测线收盘价：{prev_close}")
-                print(f"   └── 🔎 突破检测(T=-2): {'✅满足' if bull_current or bear_current else '❌未满足'} | 前三根保持沉寂: {'✅是' if bull_pre_check or bear_pre_check else '❌否(已有前值)'}")
+                print(f"   └── 🔎 突破检测(T=-2): {'✅满足' if bull_current or bear_current else '❌未满足'} | 前两根保持沉寂: {'✅是' if bull_pre_check or bear_pre_check else '❌否(已有前值)'}")
                 print("-" * 60)
 
                 # 4. 信号判断
@@ -162,7 +160,7 @@ class AutoAlertBot:
                     new_signal = 'LONG'
                     alert_text = f"多头起爆确认 (价格{prev_close:.2f} 首次站上三均线)"
                 
-                # --- 开空逻辑 ---
+                # --- 开空逻辑 --- 
                 # 逻辑：当前K线跌破均线 AND 前三根K线都在均线之上(或未完全跌破)
                 elif bear_current and bear_pre_check:
                     new_signal = 'SHORT'
