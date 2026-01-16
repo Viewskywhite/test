@@ -167,16 +167,16 @@ class AutoAlertBot:
             # 多头: 128>373, 触发阳, 确认阳, 确认Low>128
             if (trig['ma128'] > trig['ma373']) and (trig['close'] > trig['open']) and \
                (conf['close'] > conf['open']) and (conf['low'] > conf['ma128']):
-                signal_msg = "🚀 [1H] 两均线可以开多 (插针低点大于128)"
+                signal_msg = "可以开多啦"
 
             # 空头: 128<373, 触发阴, 确认阴, 确认High<128
             elif (trig['ma128'] < trig['ma373']) and (trig['close'] < trig['open']) and \
                  (conf['close'] < conf['open']) and (conf['high'] < conf['ma128']):
-                signal_msg = "📉 [1H] 两均线可以开空 (插针高点小于128)"
+                signal_msg = "可以开空啦"
 
             if signal_msg:
                 print(f"\n⚡⚡ {signal_msg} ⚡⚡")
-                self.send_bark("老板发财", signal_msg)
+                self.send_bark("九道盟策略提醒老板发财：", signal_msg)
                 self.last_ts_2ma = ts
 
     # =================================================================
