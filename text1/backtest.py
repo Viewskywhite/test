@@ -19,8 +19,8 @@ ENABLE_SHORT = True     # 是否允许做空
 
 # 【注意】这里是回测的时间范围
 # 你的CSV文件必须包含这段时间的数据，否则会报错空数据
-START_TIME = '2025-12-01 00:00:00'  
-END_TIME   = '2026-01-10 00:00:00'  
+START_TIME = '2024-01-01 00:00:00'  
+END_TIME   = '2026-01-01 00:00:00'   
 
 # === 核心参数 ===
 LEVERAGE = 10           # 杠杆倍数
@@ -30,14 +30,24 @@ TP_PERCENT_SHORT = 0.013     # 空单止盈比例
 SL_PERCENT_SHORT = 0.04     # 空单止损比例
 FEE_RATE = 0.0004       # 手续费 (万5)
 
-# === 仓位管理 （复利）===
-FIXED_MARGIN_RATE = 0.7 # 每次开单的金额比例
+# === 仓位管理===
+#True是打开复利，False是关闭复利
+MIX_UP = True      
+FIXED_MARGIN_RATE = 0.7 # 每次复利开单的金额比例
+
+MAX_OPEN = True  # 是否启用最大开仓金额限制
+MAX_OPEN_LIMIT=500000  # 最大开仓金额.      想要长时间的稳定收益就调小，10万后每加10万峰值收益率提升高1000%左右。
 
 # ===偏离值===
 #True是打开偏离值，False为关闭偏离值
 SIDE_DISTANCE_SWITCH = True
 SAME_SIDE_DISTANCE_LONG = 0.015
 SAME_SIDE_DISTANCE_SHORT =0.015
+
+#===连续开单风险控制===
+ENABLE_CONSECUTIVE_FILTER = False  # 总开关：True开启，False关闭
+MAX_CONS_LONG  = 5   # 连续做多最大次数 (比如允许连续追4次多)
+MAX_CONS_SHORT = 5   # 连续做空最大次数 (比如只允许连续追2次空)
 
 # --- RSI 策略参数 ---
 RSI_PERIOD = 14       
@@ -149,6 +159,9 @@ def run_backtest(df):
     
     # 👇【核心1】新增记忆变量：记录“上一单”的方向
     last_trade_type = None 
+
+    #初始化计数器
+    consecutive_counts = 0
     
     start_index = 375
     
@@ -215,56 +228,73 @@ def run_backtest(df):
         for order in orders_to_remove: active_orders.remove(order)
 
         # =========================================
-        # 第二步：检查【开仓】(加入同向过滤逻辑)
+        # 第二步：检查【开仓】
         # =========================================
         if len(active_orders) < MAX_ORDERS:
             signal = None
             
-            # --- 1. 先判断基础信号 (Standard Logic) ---
-            # 🟢 基础多单条件
+            # -----------------------------------------------------------------
+            # 1. 基础信号生成 (Base Signal)
+            # -----------------------------------------------------------------
             if ENABLE_LONG and (last_close > last_ma31 and last_ma31 > last_ma128 and last_ma128 > last_ma373):
                 signal = 'long'
-                
-            # 🔴 基础空单条件
             elif ENABLE_SHORT and (last_close < last_ma373 and last_ma31 < last_ma128):
                 signal = 'short'
             
-            # --- 2. 👇【核心2】再应用“同向过滤”逻辑 ---
-            # 直接判断布尔值，只要 SIDE_DISTANCE_SWITCH 为 True 就会执行
-            if SIDE_DISTANCE_SWITCH:
-                if signal:
-                    # 只有当【本次信号】等于【上次方向】时，才进行严苛检查
-                    if last_trade_type is not None and signal == last_trade_type:
-                        
-                        # --- 过滤同向追多 ---
-                        # 逻辑：如果做多，价格必须比 MA373 高出一定比例 (例如 1.5%)
-                        if signal == 'long':
-                            threshold = last_ma373 * (1 + SAME_SIDE_DISTANCE_LONG)
-                            # 如果当前开盘价 <= 阈值 (说明离均线不够远，还在缠绕)，则撤销信号
-                            if current_open <= threshold:
-                                # print(f"🚫 过滤同向追多: 离均线不够远 (当前:{current_open} < 需:{threshold:.2f})")
-                                signal = None 
+            # -----------------------------------------------------------------
+            # 2. 过滤模块 A：同向均线距离过滤 (Distance Filter)
+            # -----------------------------------------------------------------
+            # 解释：逻辑是平级的，单独一个 if 块
+            if SIDE_DISTANCE_SWITCH and signal:
+                # 只有当【本次信号】等于【上次方向】时，才检查距离
+                if last_trade_type is not None and signal == last_trade_type:
+                    if signal == 'long':
+                        threshold = last_ma373 * (1 + SAME_SIDE_DISTANCE_LONG)
+                        if current_open <= threshold: signal = None # 离均线不够远，撤单
+                    elif signal == 'short':
+                        threshold = last_ma373 * (1 - SAME_SIDE_DISTANCE_SHORT)
+                        if current_open >= threshold: signal = None # 离均线不够远，撤单
 
-                        # --- 过滤同向追空 ---
-                        # 逻辑：如果做空，价格必须比 MA373 低出一定比例
-                        elif signal == 'short':
-                            threshold = last_ma373 * (1 - SAME_SIDE_DISTANCE_SHORT)
-                            # 如果当前开盘价 >= 阈值 (说明离均线不够远)，则撤销信号
-                            if current_open >= threshold:
-                                # print(f"🚫 过滤同向追空: 离均线不够远 (当前:{current_open} > 需:{threshold:.2f})")
-                                signal = None 
+            # -----------------------------------------------------------------
+            # 3. 过滤模块 B：连续开单限制 (Consecutive Limit Filter)
+            # -----------------------------------------------------------------
+            # 解释：逻辑是平级的，缩进最外层，不依赖上面的模块 A
+            if ENABLE_CONSECUTIVE_FILTER and signal:
+                # 只有当【本次信号】等于【上次方向】时，才检查计数
+                if last_trade_type == signal:
+                    # 🛑 检查多单限制
+                    if signal == 'long' and consecutive_counts >= MAX_CONS_LONG:
+                        signal = None 
+                    # 🛑 检查空单限制
+                    elif signal == 'short' and consecutive_counts >= MAX_CONS_SHORT:
+                        signal = None 
 
-            # --- 3. 执行开仓 ---
+            # -----------------------------------------------------------------
+            # 4. 执行开仓 (Execution)
+            # -----------------------------------------------------------------
             if signal:
+                
+                # ✅ 更新计数器 (只要真开了单，就更新计数)
+                if last_trade_type == signal:
+                    consecutive_counts += 1
+                else:
+                    consecutive_counts = 1
 
-                last_trade_type = signal #记录方向
+                last_trade_type = signal # 更新记忆
                 
                 # ------------------------------------------------------
                 # 1. 计算目标仓位大小
                 # ------------------------------------------------------
-                target_margin = balance * FIXED_MARGIN_RATE          # 复利模式
-                #target_margin = INITIAL_BALANCE    # 单利模式 (推荐配合备用金)
+                if MIX_UP:
+                   target_margin = balance * FIXED_MARGIN_RATE          # 复利模式
+                else:
+                   target_margin = INITIAL_BALANCE   # 单利模式 (推荐配合备用金)
                 
+                if MAX_OPEN:
+
+                    if MAX_OPEN_LIMIT > 0 and target_margin > MAX_OPEN_LIMIT:
+                       target_margin = MAX_OPEN_LIMIT
+
                 if target_margin < 5: continue 
 
                 # 计算实际需要的资金 (保证金 + 手续费)
