@@ -21,7 +21,7 @@ CONFIG = {
 
     # --- 网络与通知 ---
     'USE_PROXY': False,            # ⚠️ 国内请设为 True
-    'PROXY_URL': 'http://127.0.0.1:7897',  # 根据你的代理端口修改
+    'PROXY_URL': 'http://127.0.0.1:7890',  # 根据你的代理端口修改
     
     'ENABLE_TTS': True,         
     'ENABLE_BARK': True,        
@@ -166,21 +166,21 @@ class AutoAlertBot:
         
         # 条件1: 第一根收盘K线是阳线，且上上根K线是阳线且MA128穿过
         if first_is_bull and second_is_bull and ma128_crosses:
-            signal_msg = "可以开多啦"
+            signal_msg = "可以多啦"
         
         # 条件2: 第一根收盘K线是阴线，且上上根K线是阴线且MA128穿过
         elif first_is_bear and second_is_bear and ma128_crosses:
-            signal_msg = "可以开空啦"
+            signal_msg = "可以空啦"
         
         # 触发报警
         if signal_msg:
             # 根据交易对生成不同的通知内容
             if symbol == 'BTC/USDT':
-                title = "老板大饼发财啦"
-                content = f" BTC {signal_msg}"
+                title = "祝老板发财"
+                content = f"'大饼' {signal_msg}"
             else:  # ETH/USDT
-                title = "老板小饼发财啦"
-                content = f"ETH {signal_msg}"
+                title = "祝老板发财"
+                content = f"'小饼' {signal_msg}"
             
             print(f"\n⚡⚡ [{symbol}] {signal_msg} ⚡⚡")
             print(f"   第一根收盘K线: {'阳线' if first_is_bull else '阴线'} | 价格: {first_closed['close']:.2f}")
