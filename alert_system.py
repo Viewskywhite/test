@@ -3,189 +3,254 @@ import pandas as pd
 import time
 import requests
 import pyttsx3
+import datetime
 
 # =================================================================
 # 👇👇👇 【配置区域】 👇👇👇
 # =================================================================
 CONFIG = {
-    'SYMBOL': 'BTC/USDT',       
-    'TIMEFRAME': '5m',          
+    # --- 交易对设置 ---
+    'SYMBOLS': ['BTC/USDT', 'ETH/USDT'],  # 同时监控BTC和ETH
     
-    # ⚠️ 这里的开关要注意：
-    # 如果你在国内本地运行，必须设为 True
-    # 如果你在海外服务器(AWS/香港阿里云)运行，设为 False
-    'USE_PROXY': True,           
-    'PROXY_URL': 'http://127.0.0.1:7890', # 你的梯子端口(Clash通常是7890)
+    # --- ⚠️ 时间周期设置 ---
+    'TIMEFRAME': '15m',    # 15分钟K线
+    
+    # --- 策略开关 ---
+    'ENABLE_BTC': True,    # 是否启用BTC检测
+    'ENABLE_ETH': True,    # 是否启用ETH检测
+
+    # --- 网络与通知 ---
+    'USE_PROXY': True,            # ⚠️ 国内请设为 True
+    'PROXY_URL': 'http://127.0.0.1:7897',  # 根据你的代理端口修改
     
     'ENABLE_TTS': True,         
     'ENABLE_BARK': True,        
-    'BARK_URL': 'https://api.day.app/MtNFHgi5zjRjdDQPoRJX9j/', 
+    'BARK_URLS': ['https://api.day.app/MtNFHgi5zjRjdDQPoRJX9j/',
+                   'https://api.day.app/HV36M6pFqEbJCAh8eWbbCT/'],
 }
 # =================================================================
 
 class AutoAlertBot:
     def __init__(self):
-        print("🤖 正在初始化机器人...")
-        self.last_signal = None 
-        self.engine = None
+        print("🤖 正在初始化15分钟K线检测机器人 (永续合约版)...")
         
-        if CONFIG['ENABLE_TTS']: self._init_voice()
-
-        # 1. 基础配置 (强制 U本位合约)
-        exchange_args = {
-            'timeout': 30000,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'} 
+        # --- 状态记录 (每个交易对独立记录) ---
+        self.last_ts = {
+            'BTC/USDT': None,
+            'ETH/USDT': None
         }
         
-        # 2. 根据开关决定是否挂代理
+        # --- 数据快照 (用于打印) ---
+        self.data_snapshot = {
+            'BTC/USDT': {'price': 0, 'ma128': 0, 'last_signal': None},
+            'ETH/USDT': {'price': 0, 'ma128': 0, 'last_signal': None}
+        }
+        
+        self.engine = None
+        if CONFIG['ENABLE_TTS']: self._init_voice()
+
+        # 初始化交易所连接
+        exchange_args = {
+            'timeout': 30000, 
+            'enableRateLimit': True, 
+            'options': {'defaultType': 'future'}  # ⚠️ 强制指定 U本位合约数据
+        }
+        
         if CONFIG['USE_PROXY']:
-            print(f"🌍 检测到代理模式开启，正在连接代理: {CONFIG['PROXY_URL']}...")
-            exchange_args['proxies'] = {
-                'http': CONFIG['PROXY_URL'],
-                'https': CONFIG['PROXY_URL']
-            }
+            print(f"🌍 代理模式: {CONFIG['PROXY_URL']}")
+            exchange_args['proxies'] = {'http': CONFIG['PROXY_URL'], 'https': CONFIG['PROXY_URL']}
         else:
-            print("🔗 直连模式 (无代理)...")
+            print("🔗 直连模式")
             
         self.exchange = ccxt.binance(exchange_args)
-        print(f"✅ 交易所连接配置完成")
+        symbols_str = ', '.join([s for s in CONFIG['SYMBOLS'] if (s == 'BTC/USDT' and CONFIG['ENABLE_BTC']) or (s == 'ETH/USDT' and CONFIG['ENABLE_ETH'])])
+        print(f"✅ 连接成功 | 目标: {symbols_str} (永续合约) | 周期: {CONFIG['TIMEFRAME']}")
 
     def _init_voice(self):
         try:
             self.engine = pyttsx3.init()
             self.engine.setProperty('rate', 150)
-            voices = self.engine.getProperty('voices')
-            for v in voices:
-                if 'Chinese' in v.name or 'CN' in v.id:
-                    self.engine.setProperty('voice', v.id)
-                    break
         except: pass
 
-    def play_sound(self, text):
-        if self.engine and CONFIG['ENABLE_TTS']:
-            try:
-                self.engine.say(f"，{text}")
-                self.engine.runAndWait()
-            except: pass
 
     def send_bark(self, title, content):
         if not CONFIG['ENABLE_BARK']: return
-        url = f"{CONFIG['BARK_URL'].rstrip('/')}/{title}/{content}"
-        try: requests.get(url, timeout=5)
-        except: pass
+        
+        # 获取 URL 列表 (兼容性处理：防止你万一没改配置报错)
+        urls = CONFIG.get('BARK_URLS', [])
+        # 如果用户还在用老配置 'BARK_URL'，也兼容一下
+        if 'BARK_URL' in CONFIG:
+            urls.append(CONFIG['BARK_URL'])
 
-    def fetch_data(self):
+        for base_url in urls:
+            try:
+                # 拼接完整的请求地址
+                url = f"{base_url.rstrip('/')}/{title}/{content}"
+                
+                # 发送请求
+                requests.get(url, timeout=2) # 设置2秒超时，防止卡住
+                
+            except Exception as e:
+                # 如果某一个人发送失败（比如网络不好），打印错误但【不中断】程序
+                print(f"⚠️ Bark推送失败: {e}")
+
+    def fetch_data(self, symbol, timeframe):
+        """获取指定交易对的K线数据"""
         try:
-            bars = self.exchange.fetch_ohlcv(CONFIG['SYMBOL'], timeframe=CONFIG['TIMEFRAME'], limit=500)
-            return pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            # 这里的 fetch_ohlcv 会自动使用 init 里设置的 future 选项
+            bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
+            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
         except Exception as e:
-            # 这里如果不打印详细错误，你不知道是因为断网还是别的原因
-            print(f"❌ 获取数据失败 (请检查VPN是否开启): {e}")
+            print(f"❌ 数据获取失败 [{symbol} {timeframe}]: {e}")
             return None
 
+    # =================================================================
+    # 新策略: 15分钟K线检测 - MA128穿线策略
+    # =================================================================
+    def check_15m_strategy(self, symbol, df):
+        """
+        检测逻辑：
+        1. 已经收盘的第一根K线（iloc[-2]）是阳线/阴线
+        2. 上上根K线（iloc[-3]）是阳线/阴线且MA128穿过这根K线
+        3. 满足条件后报警
+        """
+        if len(df) < 130:  # 需要足够的数据计算MA128
+            return
+        
+        # 计算MA128
+        close = pd.to_numeric(df['close'])
+        df['ma128'] = close.rolling(128).mean()
+        
+        # 获取K线
+        curr = df.iloc[-1]      # 当前实时K线（未收盘）
+        first_closed = df.iloc[-2]  # 已经收盘的第一根K线
+        second_closed = df.iloc[-3]  # 上上根K线（用于检测穿线）
+        
+        # 更新数据快照
+        self.data_snapshot[symbol] = {
+            'price': curr['close'],
+            'ma128': first_closed['ma128'],
+            'last_signal': self.data_snapshot[symbol].get('last_signal', None)
+        }
+        
+        # 检查是否已经处理过这根K线
+        ts = first_closed['timestamp']
+        if self.last_ts[symbol] == ts:
+            return
+        
+        # 判断第一根收盘K线是阳线还是阴线
+        first_is_bull = first_closed['close'] > first_closed['open']  # 阳线
+        first_is_bear = first_closed['close'] < first_closed['open']  # 阴线
+        
+        # 判断上上根K线是阳线还是阴线
+        second_is_bull = second_closed['close'] > second_closed['open']  # 阳线
+        second_is_bear = second_closed['close'] < second_closed['open']  # 阴线
+        
+        # 检查MA128是否穿过上上根K线
+        # 穿过：MA128在K线实体内部（在open和close之间）
+        ma128_val = float(second_closed['ma128'])
+        second_open = float(second_closed['open'])
+        second_close = float(second_closed['close'])
+        
+        # 计算K线实体的上下边界
+        second_top = max(second_open, second_close)
+        second_bot = min(second_open, second_close)
+        
+        # MA128穿过K线：MA128在实体内部
+        ma128_crosses = (ma128_val > second_bot) and (ma128_val < second_top)
+        
+        # 生成信号
+        signal_msg = None
+        
+        # 条件1: 第一根收盘K线是阳线，且上上根K线是阳线且MA128穿过
+        if first_is_bull and second_is_bull and ma128_crosses:
+            signal_msg = "可以开多啦"
+        
+        # 条件2: 第一根收盘K线是阴线，且上上根K线是阴线且MA128穿过
+        elif first_is_bear and second_is_bear and ma128_crosses:
+            signal_msg = "可以开空啦"
+        
+        # 触发报警
+        if signal_msg:
+            # 根据交易对生成不同的通知内容
+            if symbol == 'BTC/USDT':
+                title = "BTC 15分钟策略提醒"
+                content = f"BTC {signal_msg} | 价格: {first_closed['close']:.2f} | MA128: {ma128_val:.2f}"
+            else:  # ETH/USDT
+                title = "ETH 15分钟策略提醒"
+                content = f"ETH {signal_msg} | 价格: {first_closed['close']:.2f} | MA128: {ma128_val:.2f}"
+            
+            print(f"\n⚡⚡ [{symbol}] {signal_msg} ⚡⚡")
+            print(f"   第一根收盘K线: {'阳线' if first_is_bull else '阴线'} | 价格: {first_closed['close']:.2f}")
+            print(f"   上上根K线: {'阳线' if second_is_bull else '阴线'} | MA128: {ma128_val:.2f} (穿过: {'是' if ma128_crosses else '否'})")
+            
+            # 发送报警
+            self.send_bark(title, content)
+            
+            # TTS语音提醒
+            if CONFIG['ENABLE_TTS'] and self.engine:
+                try:
+                    tts_text = f"{symbol.replace('/USDT', '')} {signal_msg}"
+                    self.engine.say(tts_text)
+                    self.engine.runAndWait()
+                except:
+                    pass
+            
+            # 记录已处理的时间戳
+            self.last_ts[symbol] = ts
+            self.data_snapshot[symbol]['last_signal'] = signal_msg
+
+    # =================================================================
+    # 主循环
+    # =================================================================
     def run(self):
-        print(f"🚀 监控已启动 | 目标: {CONFIG['SYMBOL']} | 周期: {CONFIG['TIMEFRAME']}")
-        print("=" * 75)
+        print(f"🚀 监控启动 | 周期: {CONFIG['TIMEFRAME']} | 策略: MA128穿线检测")
+        print("=" * 60)
         
         while True:
             try:
-                # 1. 获取数据
-                df = self.fetch_data()
-                if df is None:
-                    time.sleep(5)
-                    continue
-
-                # 2. 准备计算
-                # 2. 准备计算
-                close = pd.to_numeric(df['close'])
+                # 检测BTC
+                if CONFIG['ENABLE_BTC']:
+                    df_btc = self.fetch_data('BTC/USDT', CONFIG['TIMEFRAME'])
+                    if df_btc is not None:
+                        self.check_15m_strategy('BTC/USDT', df_btc)
                 
-                # --- A. 预先计算完整的均线序列 (因为我们要回溯前几根) ---
-                ma31_series = close.rolling(31).mean()
-                ma128_series = close.rolling(128).mean()
-                ma373_series = close.rolling(373).mean()
+                # 检测ETH
+                if CONFIG['ENABLE_ETH']:
+                    df_eth = self.fetch_data('ETH/USDT', CONFIG['TIMEFRAME'])
+                    if df_eth is not None:
+                        self.check_15m_strategy('ETH/USDT', df_eth)
                 
-                # --- B. 定义一个判断函数 (检查某根K线收盘价是否大于三条均线) ---
-                def is_bullish_breakout(idx):
-                    p = float(close.iloc[idx])
-                    m1 = float(ma31_series.iloc[idx])
-                    m2 = float(ma128_series.iloc[idx])
-                    m3 = float(ma373_series.iloc[idx])
-                    # 条件：收盘价 同时大于 三条均线
-                    return (p > m1) and (p > m2) and (p > m3)
-
-                def is_bearish_breakout(idx):
-                    p = float(close.iloc[idx])
-                    m1 = float(ma31_series.iloc[idx])
-                    m2 = float(ma128_series.iloc[idx])
-                    m3 = float(ma373_series.iloc[idx])
-                    # 条件：收盘价 同时小于 三条均线
-                    return (p < m1) and (p < m2) and (p < m3)
-
-                # --- C. 获取关键数据 (用于显示和逻辑) ---
-                # 当前最新价 (仅展示)
-                current_price = float(close.iloc[-1])
-                # 上一根完成的K线 (T) 的收盘价
-                prev_close = float(close.iloc[-2])
+                # 打印面板
+                t_str = datetime.datetime.now().strftime("%H:%M:%S")
                 
-                # --- D. 执行“前4根”逻辑检测 ---
-                # T= -2 (最新完成), T-1= -3, T-2= -4, T-3= -5
+                print("\n" + "-"*60)
+                print(f"⏰ 时间: {t_str} | 交易所: Binance Future (U本位) | 周期: {CONFIG['TIMEFRAME']}")
                 
-                # 1. 检查最新完成的那一根 (必须满足条件)
-                bull_current = is_bullish_breakout(-2)
-                bear_current = is_bearish_breakout(-2)
+                if CONFIG['ENABLE_BTC']:
+                    d_btc = self.data_snapshot['BTC/USDT']
+                    print(f"【BTC/USDT】 现价: {d_btc['price']:.2f} | MA128: {d_btc['ma128']:.2f}")
+                    if d_btc['last_signal']:
+                        print(f"    └─ 上次信号: {d_btc['last_signal']}")
                 
-                # 2. 检查前3根 (必须【不】满足条件)
-                # 只要前3根里，有任意一根满足了条件，就说明早就突破了，不是“首次”
-                # 所以要求：前3根全部为 False
-                bull_pre_check = (not is_bullish_breakout(-3)) and \
-                                 (not is_bullish_breakout(-4)) and \
-                                 (not is_bullish_breakout(-5))
-                                 
-                bear_pre_check = (not is_bearish_breakout(-3)) and \
-                                 (not is_bearish_breakout(-4)) and \
-                                 (not is_bearish_breakout(-5))
-
-                # 3. 打印详细状态
-                t_str = time.strftime("%H:%M:%S")
-                print(f"[{t_str}] 🔴 实时最新价: {current_price:.2f} 检测线收盘价：{prev_close}")
-                print(f"   └── 🔎 突破检测(T=-2): {'✅满足' if bull_current or bear_current else '❌未满足'} | 前三根保持沉寂: {'✅是' if bull_pre_check or bear_pre_check else '❌否(已有前值)'}")
+                if CONFIG['ENABLE_ETH']:
+                    d_eth = self.data_snapshot['ETH/USDT']
+                    print(f"【ETH/USDT】 现价: {d_eth['price']:.2f} | MA128: {d_eth['ma128']:.2f}")
+                    if d_eth['last_signal']:
+                        print(f"    └─ 上次信号: {d_eth['last_signal']}")
+                
                 print("-" * 60)
-
-                # 4. 信号判断
-                new_signal = None
-                alert_text = ""
-
-                # --- 开多逻辑 ---
-                # 逻辑：当前K线站上均线 AND 前三根K线都在均线之下(或未完全站上)
-                if bull_current and bull_pre_check:
-                    new_signal = 'LONG'
-                    alert_text = f"多头起爆确认 (价格{prev_close:.2f} 首次站上三均线)"
-                
-                # --- 开空逻辑 ---
-                # 逻辑：当前K线跌破均线 AND 前三根K线都在均线之上(或未完全跌破)
-                elif bear_current and bear_pre_check:
-                    new_signal = 'SHORT'
-                    alert_text = f"空头起爆确认 (价格{prev_close:.2f} 首次跌破三均线)"
-                # 5. 状态机处理
-                if new_signal != self.last_signal:
-                    if new_signal:
-                        print(f"\n🔥🔥🔥 触发报警: {alert_text} 🔥🔥🔥\n")
-                        self.play_sound("趋势确立，" + alert_text)
-                        self.send_bark(alert_text, f"确认价:{prev_close}")
-                    else:
-                        print(">> 信号条件不再满足，恢复观望")
-                    
-                    self.last_signal = new_signal
-                
-                # 6. 等待
-                time.sleep(5)
+                time.sleep(10)  # 15分钟周期，每10秒检查一次即可
 
             except KeyboardInterrupt:
                 print("\n🛑 程序已停止")
                 break
             except Exception as e:
-                print(f"❌ 运行报错: {e}")
+                print(f"\n❌ 主循环报错: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(5)
 
 if __name__ == "__main__":
