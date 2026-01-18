@@ -20,7 +20,7 @@ CONFIG = {
     'ENABLE_ETH': True,    # 是否启用ETH检测
 
     # --- 网络与通知 ---
-    'USE_PROXY': True,            # ⚠️ 国内请设为 True
+    'USE_PROXY': False,            # ⚠️ 国内请设为 True
     'PROXY_URL': 'http://127.0.0.1:7897',  # 根据你的代理端口修改
     
     'ENABLE_TTS': True,         
@@ -176,11 +176,11 @@ class AutoAlertBot:
         if signal_msg:
             # 根据交易对生成不同的通知内容
             if symbol == 'BTC/USDT':
-                title = "BTC 15分钟策略提醒"
-                content = f"BTC {signal_msg} | 价格: {first_closed['close']:.2f} | MA128: {ma128_val:.2f}"
+                title = "老板大饼发财啦"
+                content = f" BTC {signal_msg}"
             else:  # ETH/USDT
-                title = "ETH 15分钟策略提醒"
-                content = f"ETH {signal_msg} | 价格: {first_closed['close']:.2f} | MA128: {ma128_val:.2f}"
+                title = "老板小饼发财啦"
+                content = f"ETH {signal_msg}"
             
             print(f"\n⚡⚡ [{symbol}] {signal_msg} ⚡⚡")
             print(f"   第一根收盘K线: {'阳线' if first_is_bull else '阴线'} | 价格: {first_closed['close']:.2f}")
