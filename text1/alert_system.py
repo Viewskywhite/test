@@ -12,7 +12,7 @@ CONFIG = {
     'SYMBOL': 'BTC/USDT',       
     
     # --- ⚠️ 时间周期设置 ---
-    'TF_2MA': '1h',    
+    'TF_2MA': '5m',    
     'TF_3MA': '5m',    
     
     # --- 策略开关 ---
@@ -149,7 +149,7 @@ class AutoAlertBot:
         if dev_msg and (time.time() - self.last_dev_time > 300):
             print(f"\n🚨 {dev_msg}")
             print(f"   (基于上一根1H收盘K线检测，非实时插针)")
-            self.send_bark("偏离过多", dev_msg)
+            #self.send_bark("偏离过多", dev_msg)
             self.last_dev_time = time.time()
 
         # --- B. 穿线开仓逻辑 (保持不变) ---

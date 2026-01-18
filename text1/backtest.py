@@ -19,16 +19,16 @@ ENABLE_SHORT = True     # 是否允许做空
 
 # 【注意】这里是回测的时间范围
 # 你的CSV文件必须包含这段时间的数据，否则会报错空数据
-START_TIME = '2024-01-01 00:00:00'  
-END_TIME   = '2026-01-01 00:00:00'   
+START_TIME = '2026-01-01 00:00:00'  
+END_TIME   = '2026-01-10 00:00:00'   
 
 # === 核心参数 ===
-LEVERAGE = 10           # 杠杆倍数
-TP_PERCENT_LONG = 0.014      # 多单止盈比例
-SL_PERCENT_LONG = 0.041       # 多单止损比例
-TP_PERCENT_SHORT = 0.013     # 空单止盈比例
-SL_PERCENT_SHORT = 0.04     # 空单止损比例
-FEE_RATE = 0.0004       # 手续费 (万5)
+LEVERAGE =10           # 杠杆倍数
+TP_PERCENT_LONG = 0.02      # 多单止盈比例
+SL_PERCENT_LONG = 0.009      # 多单止损比例
+TP_PERCENT_SHORT = 0.02     # 空单止盈比例
+SL_PERCENT_SHORT = 0.009     # 空单止损比例
+FEE_RATE = 0.0002       # 手续费 (万5)
 
 # === 仓位管理===
 #True是打开复利，False是关闭复利
@@ -36,23 +36,20 @@ MIX_UP = True
 FIXED_MARGIN_RATE = 0.7 # 每次复利开单的金额比例
 
 MAX_OPEN = True  # 是否启用最大开仓金额限制
-MAX_OPEN_LIMIT=2000000  # 最大开仓金额.      想要长时间的稳定收益就调小，10万后每加10万峰值收益率提升高1000%左右。 9w
+MAX_OPEN_LIMIT=100000  # 最大开仓金额.      想要长时间的稳定收益就调小，10万后每加10万峰值收益率提升高1000%左右。 9w
 
 # ===偏离值===
 #True是打开偏离值，False为关闭偏离值
 SIDE_DISTANCE_SWITCH = True
-SAME_SIDE_DISTANCE_LONG = 0.015
-SAME_SIDE_DISTANCE_SHORT =0.015
+SAME_SIDE_DISTANCE_LONG = 0.015   #多单偏离值
+SAME_SIDE_DISTANCE_SHORT = 0.015   #空单偏离值
 
 #===连续开单风险控制===
 ENABLE_CONSECUTIVE_FILTER = False  # 总开关：True开启，False关闭
 MAX_CONS_LONG  = 5   # 连续做多最大次数 (比如允许连续追4次多)
 MAX_CONS_SHORT = 5   # 连续做空最大次数 (比如只允许连续追2次空)
 
-# --- RSI 策略参数 ---
-RSI_PERIOD = 14       
-RSI_OVERBOUGHT = 75   
-RSI_OVERSOLD = 25     
+
 
 def load_from_csv(file_path):
     """
@@ -119,237 +116,305 @@ def calculate_rsi(df, period=14):
     return 100 - (100 / (1 + rs))
 
 def run_backtest(df):
-
-    # 2. 账户初始化
+    """
+    修正后的回测引擎：
+    1. 解决了无限刷单Bug (T+1机制)
+    2. 解决了手续费漏扣问题 (双向万2)
+    3. 解决了挂单永不过期的问题
+    """
+    
+    # 判空
     if df.empty:
-        print("数据为空，无法回测")
-        return [], [], 0 # 👈 返回值增加一个
+        print("❌ 数据为空，无法回测")
+        return [], [], 0
+    
+    if df.empty:
+        print("❌ 数据为空，无法回测")
+        return [], [], 0
 
-    # ... (前面的代码保持不变) ...
-    
-    # 2. 账户初始化
-    balance = INITIAL_BALANCE
-    reserve_fund = INITIAL_RESERVE  # 🆕 必须在这里初始化备用金
-    
-    active_orders = []   
-    closed_trades = []   
-    equity_curve = []    
-    last_trade_type = None
-
-    # 剔除最后一行
-    df = df[:-1].reset_index(drop=True)
-    
-    # 打印当前模式
-    mode_str = []
-    if ENABLE_LONG: mode_str.append("做多")
-    if ENABLE_SHORT: mode_str.append("做空")
-    mode_msg = " + ".join(mode_str) if mode_str else "观察模式"
-    print(f"🔄 开始回测 | 模式:【{mode_msg}】 | 杠杆:{LEVERAGE}x")
-    
-    # 1. 计算指标
+    # =========================================
+    # 🚨【补全步骤】必须先计算指标，否则后面会报错 KeyError
+    # =========================================
+    # 确保按照 Close 列计算均线
     df['ma31'] = df['close'].rolling(31).mean()
     df['ma128'] = df['close'].rolling(128).mean()
     df['ma373'] = df['close'].rolling(373).mean()
 
-    # 2. 账户初始化
-    balance = INITIAL_BALANCE
-    active_orders = []   
-    closed_trades = []   
-    equity_curve = []    
-    
-    # 👇【核心1】新增记忆变量：记录“上一单”的方向
-    last_trade_type = None 
+    print("✅ 指标计算完成 (MA31, MA128, MA373)")
 
-    #初始化计数器
+    # === 1. 账户初始化 ===
+    balance = INITIAL_BALANCE
+    reserve_fund = INITIAL_RESERVE
+    
+    active_orders = []   # 持仓单
+    closed_trades = []   # 已平仓记录
+    equity_curve = []    # 资金曲线
+    
+    # 挂单变量 (Pending Order)
+    pending_order = None 
+    
+    # 状态记忆
+    last_trade_type = None
     consecutive_counts = 0
     
-    start_index = 375
+    # 预留计算MA的长度
+    start_index = 375 
     
-    # 进度条提示
-    print(f"⏳ 正在逐根K线模拟交易 ({len(df)} 根)...")
+    print(f"🔄 开始回测 | 费率: {FEE_RATE*10000:.0f}‱ (万{FEE_RATE*10000:.0f}) | 杠杆: {LEVERAGE}x")
+    print(f"⏳ 正在逐根K线模拟 ({len(df) - start_index} 根)...")
 
+    # === 2. 主循环 ===
     for i in range(start_index, len(df)):
         
-        # === 数据准备 ===
-        last_close = float(df.loc[i-1, 'close'])
-        last_ma31  = float(df.loc[i-1, 'ma31'])
-        last_ma128 = float(df.loc[i-1, 'ma128'])
-        last_ma373 = float(df.loc[i-1, 'ma373'])
-
-        current_open  = float(df.loc[i, 'open'])   
-        current_close = float(df.loc[i, 'close'])  
-        current_time  = df.loc[i, 'timestamp']
-
-        current_ma128 = float(df.loc[i, 'ma128'])
+        # --- 获取数据 ---
+        # 当前K线 (用于撮合交易)
+        row = df.iloc[i]
+        current_time  = row['timestamp']
+        current_open  = float(row['open'])
+        current_high  = float(row['high'])
+        current_low   = float(row['low'])
+        current_close = float(row['close'])
         
-        # =========================================
-        # 第一步：检查【平仓】
-        # =========================================
-        orders_to_remove = []
-        for order in active_orders:
-            profit = 0
-            is_closed = False
-            close_reason = ""
-            exec_price = current_close 
+        # 上一根K线 (用于生成信号 - 杜绝未来函数)
+        prev_row = df.iloc[i-1]
+        last_close = float(prev_row['close'])
+        last_ma31  = float(prev_row['ma31'])
+        last_ma128 = float(prev_row['ma128'])
+        last_ma373 = float(prev_row['ma373'])
+
+        # 临时变量：记录本根K线刚刚成交的单子
+        # (刚成交的单子不参与当根K线的平仓检查，防止日内高频刷单)
+        newly_filled_order = None 
+
+        # ============================================================
+        # 🟢【阶段一：挂单撮合 (Entry Logic)】
+        # ============================================================
+        if pending_order is not None:
+            is_filled = False
+            fill_price = 0
             
+            # --- 检查是否成交 ---
+            # 1. 买单 (Long)
+            if pending_order['type'] == 'long':
+                # 如果开盘价更低，直接以开盘价成交 (滑点优势)
+                if current_open <= pending_order['price']:
+                    is_filled = True
+                    fill_price = current_open
+                # 否则看最低价是否跌破
+                elif current_low <= pending_order['price']:
+                    is_filled = True
+                    fill_price = pending_order['price']
+            
+            # 2. 卖单 (Short)
+            elif pending_order['type'] == 'short':
+                # 如果开盘价更高，直接以开盘价成交
+                if current_open >= pending_order['price']:
+                    is_filled = True
+                    fill_price = current_open
+                # 否则看最高价是否冲过
+                elif current_high >= pending_order['price']:
+                    is_filled = True
+                    fill_price = pending_order['price']
+
+            # --- 成交处理 ---
+            if is_filled:
+                real_order = pending_order.copy()
+                real_order['entry_price'] = fill_price
+                real_order['open_time'] = current_time
+                
+                # 💰【扣除开仓手续费】(按名义价值计算)
+                # 名义价值 = 成交价 * 数量
+                trade_value = real_order['amount'] * fill_price
+                entry_fee = trade_value * FEE_RATE
+                
+                balance -= entry_fee  # 直接从余额扣除
+                real_order['entry_fee'] = entry_fee # 记录一下
+                
+                newly_filled_order = real_order # 暂存，稍后加入持仓
+                
+            else:
+                # ⚠️【关键】如果没成交，挂单失效，必须退还冻结的保证金！
+                # 否则你的钱会被一直冻结，最后没钱开单
+                balance += pending_order['margin']
+            
+            # 无论是否成交，挂单在当前K线结束时都清空 (Expire)
+            pending_order = None
+
+        # ============================================================
+        # 🔵【阶段二：持仓管理 (Exit Logic)】
+        # ============================================================
+        orders_to_keep = []
+        
+        for order in active_orders:
+            is_closed = False
+            exit_price = 0
+            close_reason = ""
+            
+            # --- 多单止盈止损 ---
             if order['type'] == 'long':
-                if current_close <= order['sl_price']:
-                    is_closed = True; close_reason = "止损"; exec_price = current_close 
-                elif current_close >= order['tp_price']:
-                    is_closed = True; close_reason = "止盈"; exec_price = current_close
-                if is_closed:
-                    pnl = (exec_price - order['entry_price']) * order['amount'] - (exec_price * order['amount'] * FEE_RATE) - order['entry_fee']
-                    balance += order['margin'] + pnl; profit = pnl
+                # 1. 止损 (SL)
+                if current_low <= order['sl_price']:
+                    is_closed = True
+                    close_reason = "止损"
+                    # 防穿仓：如果开盘直接跳空到止损下方，按开盘价损
+                    exit_price = current_open if current_open < order['sl_price'] else order['sl_price']
+                
+                # 2. 止盈 (TP)
+                elif current_high >= order['tp_price']:
+                    is_closed = True
+                    close_reason = "止盈"
+                    exit_price = current_open if current_open > order['tp_price'] else order['tp_price']
 
+            # --- 空单止盈止损 ---
             elif order['type'] == 'short':
-                if current_close >= order['sl_price']:
-                    is_closed = True; close_reason = "止损"; exec_price = current_close
-                elif current_close <= order['tp_price']:
-                    is_closed = True; close_reason = "止盈"; exec_price = current_close
-                if is_closed:
-                    pnl = (order['entry_price'] - exec_price) * order['amount'] - (exec_price * order['amount'] * FEE_RATE) - order['entry_fee']
-                    balance += order['margin'] + pnl; profit = pnl
-                    if balance < 0:
-                        # 如果余额归零，尝试用备用金填坑，或者直接标记破产
-                        if reserve_fund > abs(balance):
-                            reserve_fund += balance # 填坑
-                            balance = 0
-                        else:
-                            print("💀 账户彻底破产！")
-                            balance = 0 # 实际上这里应该直接结束回测 break
+                # 1. 止损 (SL)
+                if current_high >= order['sl_price']:
+                    is_closed = True
+                    close_reason = "止损"
+                    exit_price = current_open if current_open > order['sl_price'] else order['sl_price']
+                
+                # 2. 止盈 (TP)
+                elif current_low <= order['tp_price']:
+                    is_closed = True
+                    close_reason = "止盈"
+                    exit_price = current_open if current_open < order['tp_price'] else order['tp_price']
 
+            # --- 结算 ---
             if is_closed:
-                icon = "🟢" if profit > 0 else "🔴"
-                # print(f"[{current_time}] {icon} 平仓({order['type']}) | {close_reason} | 盈亏: {profit:.2f} U | 原因: {close_reason}")
-                closed_trades.append({'profit': profit, 'time': current_time})
-                orders_to_remove.append(order)
-                #print(f"[{current_time}] 平仓: {close_reason} | 盈亏: {profit:.2f})
+                # 1. 计算盘面盈亏
+                if order['type'] == 'long':
+                    pnl = (exit_price - order['entry_price']) * order['amount']
+                else:
+                    pnl = (order['entry_price'] - exit_price) * order['amount']
+                
+                # 💰【扣除平仓手续费】(按名义价值计算)
+                exit_value = exit_price * order['amount']
+                exit_fee = exit_value * FEE_RATE
+                
+                # 净利润 = 盘面盈亏 - 平仓费
+                # (注意：开仓费之前已经从balance扣了，保证金之前也扣了)
+                net_pnl = pnl - exit_fee
+                
+                # 资金回笼 = 保证金 + 净利润
+                balance += order['margin'] + net_pnl
+                
+                # 备用金检查
+                if balance < 0:
+                    if reserve_fund > abs(balance):
+                        reserve_fund += balance # 填坑
+                        balance = 0
+                    else:
+                        balance = 0 # 破产
+                
+                # 记录
+                closed_trades.append({
+                    'time': current_time,
+                    'type': order['type'],
+                    'profit': net_pnl, # 这是扣除平仓费后的净利
+                    'entry_fee': order['entry_fee'], # 记录一下当时的开仓费
+                    'exit_fee': exit_fee,
+                    'reason': close_reason
+                })
+            else:
+                orders_to_keep.append(order)
+        
+        # 更新持仓列表
+        active_orders = orders_to_keep
+        
+        # 将本轮刚成交的单子加入，准备下一轮监控 (T+1)
+        if newly_filled_order:
+            active_orders.append(newly_filled_order)
 
-        for order in orders_to_remove: active_orders.remove(order)
-
-        # =========================================
-        # 第二步：检查【开仓】
-        # =========================================
-        if len(active_orders) < MAX_ORDERS:
+        # ============================================================
+        # 🟡【阶段三：信号生成 (Signal Logic)】
+        # ============================================================
+        # 只有在 (无挂单) 且 (未满仓) 时才开单
+        if pending_order is None and len(active_orders) < MAX_ORDERS:
             signal = None
             
-            # -----------------------------------------------------------------
-            # 1. 基础信号生成 (Base Signal)
-            # -----------------------------------------------------------------
-            if ENABLE_LONG and (last_close > last_ma31 and last_ma31 > last_ma128 and last_ma128 > last_ma373):
+            # 1. 均线排列判断
+            if ENABLE_LONG and (last_close > last_ma31 > last_ma128):
                 signal = 'long'
-            elif ENABLE_SHORT and (last_close < last_ma373 and last_ma31 < last_ma128):
+            elif ENABLE_SHORT and (last_close < last_ma31 and last_ma31 < last_ma128):
                 signal = 'short'
             
-            # -----------------------------------------------------------------
-            # 2. 过滤模块 A：同向均线距离过滤 (Distance Filter)
-            # -----------------------------------------------------------------
-            # 解释：逻辑是平级的，单独一个 if 块
+            # 2. 偏离值过滤
             if SIDE_DISTANCE_SWITCH and signal:
-                # 只有当【本次信号】等于【上次方向】时，才检查距离
-                if last_trade_type is not None and signal == last_trade_type:
+                if last_trade_type == signal: # 只有同向才检查
                     if signal == 'long':
-                        threshold = last_ma373 * (1 + SAME_SIDE_DISTANCE_LONG)
-                        if current_open <= threshold: signal = None # 离均线不够远，撤单
+                        thresh = last_ma31 * (1 + SAME_SIDE_DISTANCE_LONG)
+                        if last_close <= thresh: signal = None
                     elif signal == 'short':
-                        threshold = last_ma373 * (1 - SAME_SIDE_DISTANCE_SHORT)
-                        if current_open >= threshold: signal = None # 离均线不够远，撤单
+                        thresh = last_ma31 * (1 - SAME_SIDE_DISTANCE_SHORT)
+                        if last_close >= thresh: signal = None
 
-            # -----------------------------------------------------------------
-            # 3. 过滤模块 B：连续开单限制 (Consecutive Limit Filter)
-            # -----------------------------------------------------------------
-            # 解释：逻辑是平级的，缩进最外层，不依赖上面的模块 A
+            # 3. 连续开单过滤
             if ENABLE_CONSECUTIVE_FILTER and signal:
-                # 只有当【本次信号】等于【上次方向】时，才检查计数
                 if last_trade_type == signal:
-                    # 🛑 检查多单限制
-                    if signal == 'long' and consecutive_counts >= MAX_CONS_LONG:
-                        signal = None 
-                    # 🛑 检查空单限制
-                    elif signal == 'short' and consecutive_counts >= MAX_CONS_SHORT:
-                        signal = None 
+                    if signal == 'long' and consecutive_counts >= MAX_CONS_LONG: signal = None
+                    elif signal == 'short' and consecutive_counts >= MAX_CONS_SHORT: signal = None
 
-            # -----------------------------------------------------------------
-            # 4. 执行开仓 (Execution)
-            # -----------------------------------------------------------------
+            # --- 生成挂单 ---
             if signal:
-                
-                # ✅ 更新计数器 (只要真开了单，就更新计数)
+                # 更新计数器
                 if last_trade_type == signal:
                     consecutive_counts += 1
                 else:
                     consecutive_counts = 1
+                    last_trade_type = signal
 
-                last_trade_type = signal # 更新记忆
+                # 计算本金
+                margin_to_use = balance * FIXED_MARGIN_RATE if MIX_UP else INITIAL_BALANCE
+                if MAX_OPEN and MAX_OPEN_LIMIT > 0:
+                    margin_to_use = min(margin_to_use, MAX_OPEN_LIMIT)
                 
-                # ------------------------------------------------------
-                # 1. 计算目标仓位大小
-                # ------------------------------------------------------
-                if MIX_UP:
-                   target_margin = balance * FIXED_MARGIN_RATE          # 复利模式
-                else:
-                   target_margin = INITIAL_BALANCE   # 单利模式 (推荐配合备用金)
-                
-                if MAX_OPEN:
-
-                    if MAX_OPEN_LIMIT > 0 and target_margin > MAX_OPEN_LIMIT:
-                       target_margin = MAX_OPEN_LIMIT
-
-                if target_margin < 5: continue 
-
-                # 计算实际需要的资金 (保证金 + 手续费)
-                notional_value = target_margin * LEVERAGE
-                amount = notional_value / current_open
-                actual_initial_margin = (amount * current_open) / LEVERAGE
-                entry_fee = notional_value * FEE_RATE
-                
-                total_cost = actual_initial_margin + entry_fee # 开这一单总共需要的钱
-                
-                # ------------------------------------------------------
-                # 2. 🆕 新增：备用金划转逻辑
-                # ------------------------------------------------------
-                if balance < total_cost:
-                    missing_amount = total_cost - balance # 缺多少钱
+                # 只有钱够才开
+                if margin_to_use > 5 and balance > margin_to_use:
+                    limit_price = last_close
                     
-                    # 检查备用金够不够填坑
-                    if reserve_fund >= missing_amount:
-                        # 💰 备用金充足，进行划转
-                        reserve_fund -= missing_amount
-                        balance += missing_amount
-                        print(f"[{current_time}] 🆘 余额不足，启用备用金! 补充: {missing_amount:.2f}U | 剩余备用金: {reserve_fund:.2f}U")
+                    # 预估数量 (Amount = 保证金 * 杠杆 / 价格)
+                    amount = (margin_to_use * LEVERAGE) / limit_price
+                    
+                    # 计算TP/SL
+                    if signal == 'long':
+                        tp = limit_price * (1 + TP_PERCENT_LONG)
+                        sl = limit_price * (1 - SL_PERCENT_LONG)
                     else:
-                        # 备用金也不够了，那就真的开不出来了
-                        # print(f"[{current_time}] ❌ 资金彻底耗尽 (含备用金)，无法开仓")
-                        continue
-                
-                balance -= actual_initial_margin 
-
-                # 设置止盈止损
-                if signal == 'long':
-                    tp_price = current_open * (1 + TP_PERCENT_LONG)
-                    sl_price = current_open * (1 - SL_PERCENT_LONG) 
-                else:
-                    tp_price = current_open * (1 - TP_PERCENT_SHORT)
-                    sl_price = current_open * (1 + SL_PERCENT_SHORT) 
+                        tp = limit_price * (1 - TP_PERCENT_SHORT)
+                        sl = limit_price * (1 + SL_PERCENT_SHORT)
                     
-                new_order = {
-                    'type': signal, 'entry_price': current_open, 'amount': amount,
-                    'margin': actual_initial_margin, 'tp_price': tp_price,
-                    'sl_price': sl_price, 'entry_fee': entry_fee, 'open_time': current_time
-                }
-                active_orders.append(new_order)
-                # print(f"[{current_time}] 🚀 开仓({signal}) | 价格:{current_open:.2f} | 保证金:{actual_initial_margin:.1f}U")
+                    # 💰【冻结保证金】
+                    balance -= margin_to_use
+                    
+                    pending_order = {
+                        'type': signal,
+                        'price': limit_price,
+                        'amount': amount,
+                        'margin': margin_to_use,
+                        'tp_price': tp,
+                        'sl_price': sl
+                    }
 
-        # 记录资金曲线
-        floating_pnl = 0
-        total_margin = 0
-        for order in active_orders:
-            total_margin += order['margin']
-            if order['type'] == 'long': floating_pnl += (current_close - order['entry_price']) * order['amount']
-            else: floating_pnl += (order['entry_price'] - current_close) * order['amount']
+        # ============================================================
+        # 🟣【阶段四：统计资金 (Equity Calculation)】
+        # ============================================================
+        equity = balance 
         
-        equity_curve.append(balance + total_margin + floating_pnl)
+        # 加回冻结在挂单里的钱
+        if pending_order:
+            equity += pending_order['margin']
+            
+        # 加回持仓单的保证金 + 浮动盈亏
+        for order in active_orders:
+            equity += order['margin']
+            if order['type'] == 'long':
+                equity += (current_close - order['entry_price']) * order['amount']
+            else:
+                equity += (order['entry_price'] - current_close) * order['amount']
+        
+        equity_curve.append(equity)
 
+    print(f"✅ 回测完成! 总交易数: {len(closed_trades)} | 最终权益: {equity_curve[-1]:.2f}")
     return closed_trades, equity_curve, reserve_fund
 
 # =========================================
