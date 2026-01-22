@@ -42,8 +42,8 @@ class AutoAlertBot:
         
         # --- 数据快照 (用于打印) ---
         self.data_snapshot = {
-            'BTC/USDT': {'price': 0, 'ma128': 0, 'last_signal': None},
-            'ETH/USDT': {'price': 0, 'ma128': 0, 'last_signal': None}
+            'BTC/USDT': {'price': 0, 'ma128': 0, 'ma373': 0, 'last_signal': None},
+            'ETH/USDT': {'price': 0, 'ma128': 0, 'ma373': 0, 'last_signal': None}
         }
         
         self.engine = None
@@ -98,7 +98,7 @@ class AutoAlertBot:
         """获取指定交易对的K线数据"""
         try:
             # 这里的 fetch_ohlcv 会自动使用 init 里设置的 future 选项
-            bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
+            bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=400)
             df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             return df
@@ -107,89 +107,77 @@ class AutoAlertBot:
             return None
 
     # =================================================================
-    # 新策略: 15分钟K线检测 - MA128穿线策略
+    # 新策略: 15分钟K线检测 - MA128 与 MA373 交叉报警
     # =================================================================
     def check_15m_strategy(self, symbol, df):
         """
         检测逻辑：
-        1. 已经收盘的第一根K线（iloc[-2]）是阳线/阴线
-        2. 上上根K线（iloc[-3]）是阳线/阴线且MA128穿过这根K线
-        3. 满足条件后报警
+        1. 计算 MA128、MA373
+        2. 交叉发生在「已经收盘的第一根K线」与「上一根K线」之间（即刚收盘这根形成过程中）
+        3. 金叉：上一根 MA128 < MA373，刚收盘根 MA128 > MA373 → 可以多啦
+        4. 死叉：上一根 MA128 > MA373，刚收盘根 MA128 < MA373 → 可以空啦
+        5. 报警内容保持与原先一致
         """
-        if len(df) < 130:  # 需要足够的数据计算MA128
+        if len(df) < 374:  # 需要足够的数据计算 MA373
             return
         
-        # 计算MA128
+        # 计算 MA128、MA373
         close = pd.to_numeric(df['close'])
         df['ma128'] = close.rolling(128).mean()
+        df['ma373'] = close.rolling(373).mean()
         
-        # 获取K线
-        curr = df.iloc[-1]      # 当前实时K线（未收盘）
-        first_closed = df.iloc[-2]  # 已经收盘的第一根K线
-        second_closed = df.iloc[-3]  # 上上根K线（用于检测穿线）
+        # 获取K线：当前根、已收盘第一根、上一根
+        # 交叉发生在「已经收盘的第一根」与「上一根」之间（即刚收盘这根形成过程中）
+        curr = df.iloc[-1]
+        first_closed = df.iloc[-2]   # 已经收盘的第一根K线（刚收盘这根）
+        prev_closed = df.iloc[-3]    # 上一根K线
         
         # 更新数据快照
         self.data_snapshot[symbol] = {
             'price': curr['close'],
             'ma128': first_closed['ma128'],
+            'ma373': first_closed['ma373'],
             'last_signal': self.data_snapshot[symbol].get('last_signal', None)
         }
         
-        # 检查是否已经处理过这根K线
+        # 检查是否已经处理过这根K线（用刚收盘这根的时间戳）
         ts = first_closed['timestamp']
         if self.last_ts[symbol] == ts:
             return
         
-        # 判断第一根收盘K线是阳线还是阴线
-        first_is_bull = first_closed['close'] > first_closed['open']  # 阳线
-        first_is_bear = first_closed['close'] < first_closed['open']  # 阴线
+        # 上一根 vs 刚收盘这根，判断交叉
+        ma128_prev = float(prev_closed['ma128'])
+        ma373_prev = float(prev_closed['ma373'])
+        ma128_curr = float(first_closed['ma128'])
+        ma373_curr = float(first_closed['ma373'])
         
-        # 判断上上根K线是阳线还是阴线
-        second_is_bull = second_closed['close'] > second_closed['open']  # 阳线
-        second_is_bear = second_closed['close'] < second_closed['open']  # 阴线
+        # 金叉：MA128 上穿 MA373
+        golden_cross = (ma128_prev < ma373_prev) and (ma128_curr > ma373_curr)
+        # 死叉：MA128 下穿 MA373
+        death_cross = (ma128_prev > ma373_prev) and (ma128_curr < ma373_curr)
         
-        # 检查MA128是否穿过上上根K线
-        # 穿过：MA128在K线实体内部（在open和close之间）
-        ma128_val = float(second_closed['ma128'])
-        second_open = float(second_closed['open'])
-        second_close = float(second_closed['close'])
-        
-        # 计算K线实体的上下边界
-        second_top = max(second_open, second_close)
-        second_bot = min(second_open, second_close)
-        
-        # MA128穿过K线：MA128在实体内部
-        ma128_crosses = (ma128_val > second_bot) and (ma128_val < second_top)
-        
-        # 生成信号
         signal_msg = None
-        
-        # 条件1: 第一根收盘K线是阳线，且上上根K线是阳线且MA128穿过
-        if first_is_bull and second_is_bull and ma128_crosses:
+        if golden_cross:
             signal_msg = "可以多啦"
-        
-        # 条件2: 第一根收盘K线是阴线，且上上根K线是阴线且MA128穿过
-        elif first_is_bear and second_is_bear and ma128_crosses:
+        elif death_cross:
             signal_msg = "可以空啦"
         
         # 触发报警
         if signal_msg:
-            # 根据交易对生成不同的通知内容
             if symbol == 'BTC/USDT':
                 title = "祝老板发财"
                 content = f"'大饼' {signal_msg}"
-            else:  # ETH/USDT
+            else:
                 title = "祝老板发财"
                 content = f"'小饼' {signal_msg}"
             
+            cross_type = "金叉" if golden_cross else "死叉"
             print(f"\n⚡⚡ [{symbol}] {signal_msg} ⚡⚡")
-            print(f"   第一根收盘K线: {'阳线' if first_is_bull else '阴线'} | 价格: {first_closed['close']:.2f}")
-            print(f"   上上根K线: {'阳线' if second_is_bull else '阴线'} | MA128: {ma128_val:.2f} (穿过: {'是' if ma128_crosses else '否'})")
+            print(f"   MA128 与 MA373 {cross_type} | 已收盘第一根 MA128: {ma128_curr:.2f} MA373: {ma373_curr:.2f}")
+            print(f"   上一根 MA128: {ma128_prev:.2f} MA373: {ma373_prev:.2f}")
             
-            # 发送报警
             self.send_bark(title, content)
             
-            # TTS语音提醒
             if CONFIG['ENABLE_TTS'] and self.engine:
                 try:
                     tts_text = f"{symbol.replace('/USDT', '')} {signal_msg}"
@@ -198,7 +186,6 @@ class AutoAlertBot:
                 except:
                     pass
             
-            # 记录已处理的时间戳
             self.last_ts[symbol] = ts
             self.data_snapshot[symbol]['last_signal'] = signal_msg
 
@@ -206,7 +193,7 @@ class AutoAlertBot:
     # 主循环
     # =================================================================
     def run(self):
-        print(f"🚀 监控启动 | 周期: {CONFIG['TIMEFRAME']} | 策略: MA128穿线检测")
+        print(f"🚀 监控启动 | 周期: {CONFIG['TIMEFRAME']} | 策略: MA128 与 MA373 交叉报警")
         print("=" * 60)
         
         while True:
@@ -231,13 +218,13 @@ class AutoAlertBot:
                 
                 if CONFIG['ENABLE_BTC']:
                     d_btc = self.data_snapshot['BTC/USDT']
-                    print(f"【BTC/USDT】 现价: {d_btc['price']:.2f} | MA128: {d_btc['ma128']:.2f}")
+                    print(f"【BTC/USDT】 现价: {d_btc['price']:.2f} | MA128: {d_btc['ma128']:.2f} | MA373: {d_btc['ma373']:.2f}")
                     if d_btc['last_signal']:
                         print(f"    └─ 上次信号: {d_btc['last_signal']}")
                 
                 if CONFIG['ENABLE_ETH']:
                     d_eth = self.data_snapshot['ETH/USDT']
-                    print(f"【ETH/USDT】 现价: {d_eth['price']:.2f} | MA128: {d_eth['ma128']:.2f}")
+                    print(f"【ETH/USDT】 现价: {d_eth['price']:.2f} | MA128: {d_eth['ma128']:.2f} | MA373: {d_eth['ma373']:.2f}")
                     if d_eth['last_signal']:
                         print(f"    └─ 上次信号: {d_eth['last_signal']}")
                 
